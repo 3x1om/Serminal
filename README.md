@@ -18,13 +18,21 @@ chmod +x ./serminal
 ./serminal gui
 ```
 
+## One-command install (deps + Serminal)
+
+Clone + install in one command (Open Serialis and other distros supported by `scripts/install-system.sh` package-manager detection: `pacman`, `apt`, `dnf`, `zypper`):
+
+```bash
+git clone https://github.com/3x1om/Serminal.git && cd Serminal && sudo bash scripts/install-system.sh
+```
+
 GUI shortcuts:
 
 - `Ctrl+Shift+T`: new tab
 - `Ctrl+Shift+W`: close current tab
 - `Ctrl+,`: open GUI settings
 
-Install GUI runtime deps on CachyOS/Arch:
+Manual dependency install (optional, CachyOS/Arch):
 
 ```bash
 sudo pacman -S python-gobject gtk4 vte4 chafa fastfetch ttf-jetbrains-mono-nerd
