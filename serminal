@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 import errno
 import fcntl
 import json
@@ -116,6 +117,22 @@ def runtime_base_dir() -> Path:
     else:
         _RUNTIME_BASE = Path.home()
     return _RUNTIME_BASE
+
+
+def set_process_name(name: str) -> None:
+    # Improve terminal app detection in tools that inspect process names.
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        pr_set_name = 15
+        libc.prctl(pr_set_name, ctypes.c_char_p(name.encode("utf-8")[:15]), 0, 0, 0)
+    except Exception:
+        pass
+
+
+def apply_terminal_identity() -> None:
+    os.environ.setdefault("TERM_PROGRAM", "Serminal")
+    os.environ.setdefault("TERM_PROGRAM_VERSION", "1.0")
+    set_process_name("Serminal")
 
 
 def config_dir() -> Path:
@@ -977,7 +994,7 @@ def launch_vte_gui(settings: Dict) -> int:
             self.btn_new = btn_new
 
             btn_close = Gtk.Button(label="Close Tab")
-            btn_close.add_css_class("btn-secondary")
+            btn_close.add_css_class("btn-danger-circle")
             btn_close.connect("clicked", lambda _b: self.close_current_tab())
             header.pack_end(btn_close)
             self.btn_close = btn_close
@@ -1128,6 +1145,30 @@ def launch_vte_gui(settings: Dict) -> int:
                 opacity: 1;
                 font-weight: 800;
             }}
+            button.btn-danger-circle {{
+                background: #e11d48;
+                color: #ffffff;
+                border: 1px solid #fb7185;
+                border-radius: 999px;
+                min-width: 36px;
+                min-height: 36px;
+                padding: 0;
+                box-shadow: none;
+            }}
+            button.btn-danger-circle:hover {{
+                background: #be123c;
+                border-color: #fda4af;
+            }}
+            button.btn-danger-circle:active {{
+                background: #9f1239;
+                border-color: #fda4af;
+            }}
+            button.btn-danger-circle > label {{
+                color: #ffffff;
+                opacity: 1;
+                font-weight: 800;
+                font-size: 0.95rem;
+            }}
             button.btn-hyde-glow {{
                 border-color: {t['tab_selected_border']};
                 box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.30);
@@ -1277,6 +1318,8 @@ def launch_vte_gui(settings: Dict) -> int:
             env_map = {k: v for k, v in os.environ.items()}
             env_map.setdefault("TERM", "xterm-256color")
             env_map.setdefault("COLORTERM", "truecolor")
+            env_map.setdefault("TERM_PROGRAM", "Serminal")
+            env_map.setdefault("TERM_PROGRAM_VERSION", "1.0")
             logo_type = self.apply_terminal_style(term, sixel_enabled)
             env_map.setdefault("FASTFETCH_LOGO_TYPE", logo_type)
             env_map.setdefault("FASTFETCH_LOGO_WIDTH", self.default_logo_width)
@@ -1499,6 +1542,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    apply_terminal_identity()
     args = parse_args()
     settings = load_settings()
 
