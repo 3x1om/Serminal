@@ -30,6 +30,8 @@ GUI shortcuts:
 
 - `Ctrl+Shift+T`: new tab
 - `Ctrl+Shift+W`: close current tab
+- `Ctrl+Shift+C`: copy selected text
+- `Ctrl+Shift+V`: paste from clipboard
 - `Ctrl+,`: open GUI settings
 
 Manual dependency install (optional, CachyOS/Arch):

@@ -941,6 +941,8 @@ def launch_vte_gui(settings: Dict) -> int:
             self.btn_new = None
             self.btn_close = None
             self.btn_settings = None
+            self.btn_copy = None
+            self.btn_paste = None
             self.logo_modes = ["auto", "sixel", "chafa"]
             self.theme_names = list(GUI_THEMES.keys())
             self.default_logo_width = "28"
@@ -979,13 +981,23 @@ def launch_vte_gui(settings: Dict) -> int:
             btn_close.connect("clicked", lambda _b: self.close_current_tab())
             header.pack_end(btn_close)
             self.btn_close = btn_close
+            btn_paste = Gtk.Button(label="Paste")
+            btn_paste.add_css_class("btn-secondary")
+            btn_paste.connect("clicked", lambda _b: self.paste_current_tab())
+            header.pack_end(btn_paste)
+            self.btn_paste = btn_paste
+            btn_copy = Gtk.Button(label="Copy")
+            btn_copy.add_css_class("btn-secondary")
+            btn_copy.connect("clicked", lambda _b: self.copy_current_tab())
+            header.pack_end(btn_copy)
+            self.btn_copy = btn_copy
             btn_settings = Gtk.Button(label="Settings")
             btn_settings.add_css_class("btn-secondary")
             btn_settings.connect("clicked", lambda _b: self.open_settings())
             header.pack_end(btn_settings)
             self.btn_settings = btn_settings
 
-            hint = Gtk.Label(label="Ctrl+Shift+T New Tab   Ctrl+Shift+W Close")
+            hint = Gtk.Label(label="Ctrl+Shift+T New Tab   Ctrl+Shift+W Close   Ctrl+Shift+C Copy   Ctrl+Shift+V Paste")
             hint.add_css_class("shortcut-hint")
             header.pack_start(hint)
             self.hint_label = hint
@@ -1007,6 +1019,14 @@ def launch_vte_gui(settings: Dict) -> int:
             action_settings.connect("activate", lambda _a, _p: self.open_settings())
             self.add_action(action_settings)
             self.set_accels_for_action("app.settings", ["<Ctrl>comma"])
+            action_copy = Gio.SimpleAction.new("copy", None)
+            action_copy.connect("activate", lambda _a, _p: self.copy_current_tab())
+            self.add_action(action_copy)
+            self.set_accels_for_action("app.copy", ["<Ctrl><Shift>C"])
+            action_paste = Gio.SimpleAction.new("paste", None)
+            action_paste.connect("activate", lambda _a, _p: self.paste_current_tab())
+            self.add_action(action_paste)
+            self.set_accels_for_action("app.paste", ["<Ctrl><Shift>V"])
 
             self.apply_theme()
             self.apply_shortcuts_visibility()
@@ -1311,6 +1331,45 @@ def launch_vte_gui(settings: Dict) -> int:
             self.refresh_tab_titles()
             if not self.tabs:
                 self.quit()
+
+        def current_term(self) -> Optional["Vte.Terminal"]:
+            idx = self.notebook.get_current_page()
+            if idx < 0:
+                return None
+            widget = self.notebook.get_nth_page(idx)
+            if widget is None:
+                return None
+            if widget in self.tabs:
+                return widget
+            return None
+
+        def copy_current_tab(self) -> None:
+            term = self.current_term()
+            if term is None:
+                return
+            if hasattr(term, "copy_clipboard_format"):
+                try:
+                    term.copy_clipboard_format(Vte.Format.TEXT)
+                    self.pulse_button(self.btn_copy, 170)
+                    return
+                except Exception:
+                    pass
+            if hasattr(term, "copy_clipboard"):
+                try:
+                    term.copy_clipboard()
+                    self.pulse_button(self.btn_copy, 170)
+                except Exception:
+                    pass
+
+        def paste_current_tab(self) -> None:
+            term = self.current_term()
+            if term is None:
+                return
+            try:
+                term.paste_clipboard()
+                self.pulse_button(self.btn_paste, 170)
+            except Exception:
+                pass
 
         def open_settings(self) -> None:
             dialog = Gtk.Dialog(transient_for=self.window, modal=True, title="Serminal Settings")
