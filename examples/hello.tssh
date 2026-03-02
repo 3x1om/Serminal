@@ -1,0 +1,2 @@
+@import strings
+say_hello "from .tssh"

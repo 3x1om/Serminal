@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+say_hello() {
+  echo "Hello, $1"
+}

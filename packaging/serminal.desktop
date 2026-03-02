@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Serminal
+Comment=Terminal for Open Serialis
+Exec=serminal start
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+MimeType=text/x-serminal-script;application/x-shellscript;

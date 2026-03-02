@@ -1,0 +1,1480 @@
+#!/usr/bin/env python3
+import argparse
+import errno
+import fcntl
+import json
+import os
+import pty
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+APP_NAME = "serminal"
+DEFAULT_SETTINGS = {
+    "shell": "bash",
+    "prompt": "Serminal> ",
+    "show_startup_message": True,
+    "gui": {
+        "theme": "openserialis",
+        "font": "JetBrainsMono Nerd Font 11",
+        "show_shortcuts": True,
+        "logo_mode": "auto",
+        "animations": True,
+    },
+    "aliases": {
+        "ll": "ls -alF",
+        "la": "ls -A",
+    },
+}
+
+DEFAULT_MONO_FONT_CANDIDATES = [
+    "JetBrainsMono Nerd Font 11",
+    "CaskaydiaCove Nerd Font 11",
+    "FiraCode Nerd Font 11",
+    "Hack Nerd Font 11",
+    "MesloLGS Nerd Font 11",
+    "JetBrains Mono 11",
+    "Cascadia Mono 11",
+    "Fira Code 11",
+    "Noto Sans Mono 11",
+    "DejaVu Sans Mono 11",
+]
+
+GUI_THEMES = {
+    "openserialis": {
+        "window_bg": "#0b1220",
+        "header_from": "#111827",
+        "header_to": "#0f172a",
+        "header_text": "#f8fafc",
+        "muted_text": "#94a3b8",
+        "tab_bg": "#1e293b",
+        "tab_border": "#334155",
+        "tab_selected_bg": "#155e75",
+        "tab_selected_border": "#22d3ee",
+        "tab_text": "#dbeafe",
+        "button_bg": "#1f2937",
+        "button_border": "#334155",
+        "button_text": "#f8fafc",
+        "button_hover_bg": "#0e7490",
+        "button_hover_border": "#22d3ee",
+        "button_primary_bg": "#155e75",
+        "button_primary_border": "#22d3ee",
+        "button_primary_text": "#f8fafc",
+        "term_bg": "#0f172a",
+        "term_fg": "#f1f5f9",
+        "cursor": "#22d3ee",
+    },
+    "graphite": {
+        "window_bg": "#101214",
+        "header_from": "#1a1d21",
+        "header_to": "#111418",
+        "header_text": "#f5f5f5",
+        "muted_text": "#9aa4b2",
+        "tab_bg": "#242930",
+        "tab_border": "#3a4350",
+        "tab_selected_bg": "#2f6f8f",
+        "tab_selected_border": "#5bc0de",
+        "tab_text": "#dde5ee",
+        "button_bg": "#2b3139",
+        "button_border": "#435162",
+        "button_text": "#f4f7fa",
+        "button_hover_bg": "#336c89",
+        "button_hover_border": "#5bc0de",
+        "button_primary_bg": "#2f6f8f",
+        "button_primary_border": "#5bc0de",
+        "button_primary_text": "#f8fbff",
+        "term_bg": "#151a22",
+        "term_fg": "#ecf2f8",
+        "cursor": "#5bc0de",
+    },
+}
+
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANSI_OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")
+ANSI_ESC_RE = re.compile(r"\x1b[@-Z\\-_]")
+
+_RUNTIME_BASE: Path | None = None
+_CONFIG_DIR_OVERRIDE: Path | None = None
+_DATA_DIR_OVERRIDE: Path | None = None
+
+
+def runtime_base_dir() -> Path:
+    global _RUNTIME_BASE
+    if _RUNTIME_BASE is not None:
+        return _RUNTIME_BASE
+
+    override = os.environ.get("SERMINAL_HOME")
+    if override:
+        _RUNTIME_BASE = Path(override).expanduser()
+    else:
+        _RUNTIME_BASE = Path.home()
+    return _RUNTIME_BASE
+
+
+def config_dir() -> Path:
+    if _CONFIG_DIR_OVERRIDE is not None:
+        return _CONFIG_DIR_OVERRIDE
+    home = runtime_base_dir()
+    base = os.environ.get("XDG_CONFIG_HOME", str(home / ".config"))
+    return Path(base) / APP_NAME
+
+
+def data_dir() -> Path:
+    if _DATA_DIR_OVERRIDE is not None:
+        return _DATA_DIR_OVERRIDE
+    home = runtime_base_dir()
+    base = os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share"))
+    return Path(base) / APP_NAME
+
+
+def config_path() -> Path:
+    return config_dir() / "config.json"
+
+
+def libs_dir() -> Path:
+    return data_dir() / "libs"
+
+
+def ensure_dirs() -> None:
+    global _RUNTIME_BASE, _CONFIG_DIR_OVERRIDE, _DATA_DIR_OVERRIDE
+
+    def can_write(dir_path: Path) -> bool:
+        try:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            probe = dir_path / ".serminal_write_probe"
+            with probe.open("w", encoding="utf-8") as f:
+                f.write("ok")
+            probe.unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    if can_write(config_dir()) and can_write(libs_dir()):
+        return
+
+    # Fallback for restricted environments (e.g. CI/sandboxes).
+    try:
+        local_base = Path.cwd() / ".serminal"
+        _RUNTIME_BASE = local_base
+        _CONFIG_DIR_OVERRIDE = local_base / ".config" / APP_NAME
+        _DATA_DIR_OVERRIDE = local_base / ".local" / "share" / APP_NAME
+        config_dir().mkdir(parents=True, exist_ok=True)
+        libs_dir().mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise PermissionError(f"unable to create writable Serminal dirs: {e}") from e
+
+
+def merge_defaults(raw: Dict) -> Dict:
+    merged = dict(DEFAULT_SETTINGS)
+    aliases = dict(DEFAULT_SETTINGS["aliases"])
+    gui = dict(DEFAULT_SETTINGS["gui"])
+    aliases.update(raw.get("aliases", {}))
+    gui.update(raw.get("gui", {}))
+    if gui.get("font") == "JetBrains Mono 11":
+        # Migrate old default to Nerd Font-first default.
+        gui["font"] = DEFAULT_SETTINGS["gui"]["font"]
+    merged.update(raw)
+    merged["aliases"] = aliases
+    merged["gui"] = gui
+    return merged
+
+
+def load_settings() -> Dict:
+    ensure_dirs()
+    path = config_path()
+    if not path.exists():
+        save_settings(DEFAULT_SETTINGS)
+        return dict(DEFAULT_SETTINGS)
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        raw = {}
+    return merge_defaults(raw)
+
+
+def save_settings(settings: Dict) -> None:
+    ensure_dirs()
+    with config_path().open("w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, sort_keys=True)
+
+
+def bool_from_text(value: str) -> bool:
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def gui_settings(settings: Dict) -> Dict:
+    gui = dict(DEFAULT_SETTINGS["gui"])
+    gui.update(settings.get("gui", {}))
+    return gui
+
+
+def gui_theme(theme_name: str) -> Dict[str, str]:
+    return GUI_THEMES.get(theme_name, GUI_THEMES["openserialis"])
+
+
+def script_shell(settings: Dict) -> str:
+    shell_name = settings.get("shell", "bash")
+    shell_path = shutil.which(shell_name)
+    return shell_path or "/bin/bash"
+
+
+def resolve_import(name: str, source_dir: Path) -> Path:
+    candidates = [
+        source_dir / f"{name}.sh",
+        source_dir / "libs" / f"{name}.sh",
+        libs_dir() / f"{name}.sh",
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c
+    raise FileNotFoundError(f"library '{name}' not found in local libs or {libs_dir()}")
+
+
+def expand_tssh(path: Path, visited_libs: Set[str]) -> str:
+    source_dir = path.parent
+    out: List[str] = []
+    import_re = re.compile(r"^\s*@import\s+([A-Za-z0-9_./-]+)\s*$")
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = import_re.match(line)
+        if not m:
+            out.append(line)
+            continue
+
+        lib_name = m.group(1)
+        if lib_name in visited_libs:
+            continue
+        visited_libs.add(lib_name)
+
+        lib_path = resolve_import(lib_name, source_dir)
+        out.append(f"# --- begin import {lib_name} ({lib_path}) ---")
+        out.append(lib_path.read_text(encoding="utf-8"))
+        out.append(f"# --- end import {lib_name} ---")
+
+    return "\n".join(out) + "\n"
+
+
+def run_script(path: Path, settings: Dict, extra_args: List[str]) -> int:
+    if not path.exists():
+        print(f"error: script not found: {path}", file=sys.stderr)
+        return 1
+
+    shell = script_shell(settings)
+
+    if path.suffix == ".tssh":
+        expanded = expand_tssh(path, visited_libs=set())
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as tmp:
+            tmp.write(expanded)
+            tmp_path = Path(tmp.name)
+        try:
+            result = subprocess.run([shell, str(tmp_path), *extra_args])
+            return result.returncode
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    result = subprocess.run([shell, str(path), *extra_args])
+    return result.returncode
+
+
+def apply_aliases(command: str, aliases: Dict[str, str]) -> str:
+    parts = command.strip().split(maxsplit=1)
+    if not parts:
+        return command
+    first = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    if first not in aliases:
+        return command
+    alias_cmd = aliases[first]
+    return f"{alias_cmd} {rest}".strip()
+
+
+def launch_shell(settings: Dict) -> int:
+    shell = script_shell(settings)
+    prompt = settings.get("prompt", "Serminal> ")
+    aliases = settings.get("aliases", {})
+
+    if settings.get("show_startup_message", True):
+        print("Serminal interactive mode. Type ':help' for internal commands.")
+
+    while True:
+        try:
+            raw = input(prompt)
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            continue
+
+        cmd = raw.strip()
+        if not cmd:
+            continue
+        if cmd in {":q", ":quit", ":exit"}:
+            break
+        if cmd == ":help":
+            print(
+                ":help                Show this help\n"
+                ":aliases             Show configured aliases\n"
+                ":set prompt TEXT     Set shell prompt\n"
+                ":set shell NAME      Set backend shell (bash, sh, zsh...)\n"
+                ":exit                Exit Serminal"
+            )
+            continue
+        if cmd == ":aliases":
+            for k, v in aliases.items():
+                print(f"{k} -> {v}")
+            continue
+        if cmd.startswith(":set "):
+            _, key, *value_parts = cmd.split()
+            value = " ".join(value_parts)
+            if key not in {"prompt", "shell"}:
+                print("only 'prompt' and 'shell' can be changed from interactive mode")
+                continue
+            settings[key] = value
+            save_settings(settings)
+            if key == "shell":
+                shell = script_shell(settings)
+            if key == "prompt":
+                prompt = value
+            print(f"updated {key}")
+            continue
+
+        expanded_cmd = apply_aliases(raw, aliases)
+        subprocess.run(expanded_cmd, shell=True, executable=shell)
+
+    return 0
+
+
+def settings_show(settings: Dict) -> int:
+    print(json.dumps(settings, indent=2, sort_keys=True))
+    return 0
+
+
+def settings_set(settings: Dict, key: str, value: str) -> int:
+    if key.startswith("aliases."):
+        alias_key = key.split(".", 1)[1]
+        settings.setdefault("aliases", {})[alias_key] = value
+    elif key.startswith("gui."):
+        gui_key = key.split(".", 1)[1]
+        settings.setdefault("gui", {})
+        if gui_key in {"theme", "font", "logo_mode"}:
+            settings["gui"][gui_key] = value
+        elif gui_key in {"show_shortcuts", "animations"}:
+            settings["gui"][gui_key] = bool_from_text(value)
+        else:
+            print(f"error: unsupported gui setting '{gui_key}'", file=sys.stderr)
+            return 1
+    elif key in {"shell", "prompt", "show_startup_message"}:
+        if key == "show_startup_message":
+            settings[key] = bool_from_text(value)
+        else:
+            settings[key] = value
+    else:
+        print(f"error: unsupported setting key '{key}'", file=sys.stderr)
+        return 1
+
+    save_settings(settings)
+    return 0
+
+
+def lib_list() -> int:
+    ensure_dirs()
+    libs = sorted(p.name for p in libs_dir().glob("*.sh"))
+    if not libs:
+        print("No libraries installed.")
+        return 0
+    for lib in libs:
+        print(lib)
+    return 0
+
+
+def lib_install(name: str, file_path: Path) -> int:
+    if not file_path.exists() or not file_path.is_file():
+        print(f"error: file not found: {file_path}", file=sys.stderr)
+        return 1
+    ensure_dirs()
+    target = libs_dir() / f"{name}.sh"
+    shutil.copyfile(file_path, target)
+    print(f"installed {name} -> {target}")
+    return 0
+
+
+def lib_create(name: str) -> int:
+    ensure_dirs()
+    target = libs_dir() / f"{name}.sh"
+    if target.exists():
+        print(f"error: library already exists: {target}", file=sys.stderr)
+        return 1
+
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "\n"
+        f"{name}_hello() {{\n"
+        f"  echo \"Hello from {name}\"\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    print(f"created {target}")
+    return 0
+
+
+def lib_remove(name: str) -> int:
+    target = libs_dir() / f"{name}.sh"
+    if not target.exists():
+        print(f"error: library not found: {target}", file=sys.stderr)
+        return 1
+    target.unlink()
+    print(f"removed {target}")
+    return 0
+
+
+def desktop_paths(system: bool) -> Tuple[Path, Path]:
+    if system:
+        apps = Path("/usr/share/applications")
+        mime_pkg = Path("/usr/share/mime/packages")
+    else:
+        if _DATA_DIR_OVERRIDE is not None:
+            xdg_data = str(_DATA_DIR_OVERRIDE.parent)
+        else:
+            xdg_data = os.environ.get("XDG_DATA_HOME", str(runtime_base_dir() / ".local" / "share"))
+        apps = Path(xdg_data) / "applications"
+        mime_pkg = Path(xdg_data) / "mime" / "packages"
+    return apps, mime_pkg
+
+
+def install_desktop(system: bool) -> int:
+    apps, mime_pkg = desktop_paths(system)
+    apps.mkdir(parents=True, exist_ok=True)
+    mime_pkg.mkdir(parents=True, exist_ok=True)
+
+    entry = apps / "serminal.desktop"
+    mime_xml = mime_pkg / "serminal.xml"
+
+    entry.write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=Serminal\n"
+        "Comment=Terminal for Open Serialis\n"
+        "Exec=serminal start\n"
+        "Icon=utilities-terminal\n"
+        "Terminal=false\n"
+        "Categories=System;TerminalEmulator;\n"
+        "MimeType=text/x-serminal-script;application/x-shellscript;\n",
+        encoding="utf-8",
+    )
+
+    mime_xml.write_text(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<mime-info xmlns=\"http://www.freedesktop.org/standards/shared-mime-info\">\n"
+        "  <mime-type type=\"text/x-serminal-script\">\n"
+        "    <comment>Serminal script</comment>\n"
+        "    <glob pattern=\"*.tssh\"/>\n"
+        "  </mime-type>\n"
+        "</mime-info>\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(["update-desktop-database", str(apps)], check=False)
+    subprocess.run(["update-mime-database", str(mime_pkg.parent)], check=False)
+    print(f"desktop entry: {entry}")
+    print(f"mime package: {mime_xml}")
+    return 0
+
+
+class PtyTab:
+    def __init__(self, app: "SerminalGuiApp", title: str) -> None:
+        self.app = app
+        self.title = title
+        self.frame = app.tk.Frame(app.notebook, bg=app.colors["panel"])
+        self.scroll = app.tk.Scrollbar(
+            self.frame,
+            orient="vertical",
+            bg=app.colors["muted"],
+            troughcolor=app.colors["panel"],
+            activebackground=app.colors["accent"],
+            relief="flat",
+        )
+        self.text = app.tk.Text(
+            self.frame,
+            bg=app.colors["terminal_bg"],
+            fg=app.colors["terminal_fg"],
+            insertbackground=app.colors["terminal_fg"],
+            selectbackground=app.colors["accent_dim"],
+            wrap="char",
+            undo=False,
+            yscrollcommand=self.scroll.set,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=14,
+            pady=10,
+            font=app.mono_font,
+        )
+        self.scroll.config(command=self.text.yview)
+        self.scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        self.text.focus_set()
+        self.text.mark_set("term_cursor", "end-1c")
+        self.text.mark_gravity("term_cursor", "left")
+
+        self.master_fd: Optional[int] = None
+        self.pid: Optional[int] = None
+        self.closed = False
+
+        self.text.bind("<KeyPress>", self.on_keypress)
+        self.text.bind("<Button-1>", self.on_click)
+        self.text.bind("<<Paste>>", self.on_paste)
+        self.text.bind("<Configure>", self.on_resize)
+        self.text.bind("<Control-c>", self.send_ctrl_c)
+
+        self.spawn_shell()
+
+    def spawn_shell(self) -> None:
+        shell = script_shell(self.app.settings)
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            os.environ["TERM"] = os.environ.get("TERM", "xterm-256color")
+            os.execvp(shell, [shell])
+        self.pid = pid
+        self.master_fd = master_fd
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self.resize_pty()
+
+    def resize_pty(self) -> None:
+        if self.master_fd is None:
+            return
+        width = max(self.text.winfo_width(), 200)
+        height = max(self.text.winfo_height(), 80)
+        font = self.app.tkfont.nametofont("TkFixedFont")
+        char_w = max(font.measure("0"), 1)
+        char_h = max(font.metrics("linespace"), 1)
+        cols = max(width // char_w, 20)
+        rows = max(height // char_h, 5)
+        winsz = struct_pack_winsize(rows, cols)
+        try:
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsz)
+        except OSError:
+            return
+        if self.pid is not None:
+            try:
+                os.kill(self.pid, signal.SIGWINCH)
+            except OSError:
+                pass
+
+    def on_resize(self, _event) -> None:
+        self.resize_pty()
+
+    def append_output(self, data: bytes) -> None:
+        text = decode_terminal_stream(data)
+        if not text:
+            return
+        for ch in text:
+            cursor = self.text.index("term_cursor")
+            if ch == "\b":
+                line_start = self.text.index(f"{cursor} linestart")
+                if self.text.compare(cursor, ">", line_start):
+                    self.text.mark_set("term_cursor", f"{cursor} -1c")
+                continue
+            if ch == "\r":
+                self.text.mark_set("term_cursor", f"{cursor} linestart")
+                continue
+            if ch == "\n":
+                self.text.insert("term_cursor", "\n")
+                self.text.mark_set("term_cursor", "term_cursor +1c")
+                continue
+            if ch == "\t":
+                ch = "    "
+
+            next_pos = self.text.index(f"{cursor} +1c")
+            at_eof = self.text.compare(cursor, "==", "end-1c")
+            next_is_newline = self.text.get(cursor, next_pos) == "\n"
+            if not at_eof and not next_is_newline:
+                self.text.delete(cursor, next_pos)
+            self.text.insert("term_cursor", ch)
+            self.text.mark_set("term_cursor", f"{cursor} +{len(ch)}c")
+        self.text.see("end")
+
+    def write_to_pty(self, data: bytes) -> None:
+        if self.master_fd is None:
+            return
+        try:
+            os.write(self.master_fd, data)
+        except OSError:
+            self.closed = True
+
+    def on_click(self, _event):
+        self.text.focus_set()
+        return "break"
+
+    def on_paste(self, _event):
+        try:
+            clip = self.text.clipboard_get()
+        except Exception:
+            return "break"
+        self.write_to_pty(clip.encode("utf-8", errors="ignore"))
+        return "break"
+
+    def send_ctrl_c(self, _event):
+        self.write_to_pty(b"\x03")
+        return "break"
+
+    def on_keypress(self, event):
+        if event.keysym == "BackSpace":
+            self.write_to_pty(b"\x7f")
+            return "break"
+        if event.keysym in {"Return", "KP_Enter"}:
+            self.write_to_pty(b"\r")
+            return "break"
+        if event.keysym == "Tab":
+            self.write_to_pty(b"\t")
+            return "break"
+        if event.keysym == "Escape":
+            self.write_to_pty(b"\x1b")
+            return "break"
+        if event.keysym == "Up":
+            self.write_to_pty(b"\x1b[A")
+            return "break"
+        if event.keysym == "Down":
+            self.write_to_pty(b"\x1b[B")
+            return "break"
+        if event.keysym == "Right":
+            self.write_to_pty(b"\x1b[C")
+            return "break"
+        if event.keysym == "Left":
+            self.write_to_pty(b"\x1b[D")
+            return "break"
+        if event.keysym == "Home":
+            self.write_to_pty(b"\x1b[H")
+            return "break"
+        if event.keysym == "End":
+            self.write_to_pty(b"\x1b[F")
+            return "break"
+        if event.keysym == "Delete":
+            self.write_to_pty(b"\x1b[3~")
+            return "break"
+
+        ctrl_pressed = bool(event.state & 0x4)
+        if ctrl_pressed and event.keysym and len(event.keysym) == 1 and event.keysym.isalpha():
+            code = ord(event.keysym.lower()) - ord("a") + 1
+            self.write_to_pty(bytes([code]))
+            return "break"
+
+        if event.char:
+            self.write_to_pty(event.char.encode("utf-8", errors="ignore"))
+        return "break"
+
+    def process_output(self) -> None:
+        if self.master_fd is None or self.closed:
+            return
+        while True:
+            try:
+                data = os.read(self.master_fd, 4096)
+                if not data:
+                    self.closed = True
+                    break
+                self.append_output(data)
+            except BlockingIOError:
+                break
+            except OSError as e:
+                if e.errno in {errno.EIO, errno.EBADF}:
+                    self.closed = True
+                    break
+                raise
+
+    def check_process(self) -> None:
+        if self.pid is None or self.closed:
+            return
+        try:
+            waited_pid, _ = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            self.closed = True
+            return
+        if waited_pid == self.pid:
+            self.closed = True
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.pid is not None:
+            try:
+                os.kill(self.pid, signal.SIGHUP)
+            except OSError:
+                pass
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+
+
+def struct_pack_winsize(rows: int, cols: int) -> bytes:
+    # winsize: rows, cols, xpixel, ypixel (all unsigned short)
+    return struct.pack("HHHH", rows, cols, 0, 0)
+
+
+class SerminalGuiApp:
+    def __init__(self, settings: Dict) -> None:
+        import tkinter as tk
+        from tkinter import ttk
+        import tkinter.font as tkfont
+
+        self.tk = tk
+        self.ttk = ttk
+        self.tkfont = tkfont
+        self.settings = settings
+        self.colors = {
+            "bg": "#0b1220",
+            "panel": "#111827",
+            "panel_alt": "#1f2937",
+            "terminal_bg": "#0f172a",
+            "terminal_fg": "#d1e0ff",
+            "muted": "#334155",
+            "accent": "#22d3ee",
+            "accent_dim": "#164e63",
+            "text_soft": "#9ca3af",
+        }
+        self.mono_font = ("JetBrains Mono", 11)
+
+        self.root = tk.Tk()
+        self.root.title("Serminal")
+        self.root.geometry("1100x700")
+        self.root.minsize(860, 520)
+        self.root.configure(bg=self.colors["bg"])
+        self.setup_styles()
+
+        top = tk.Frame(self.root, bg=self.colors["panel"], height=52)
+        top.pack(side="top", fill="x")
+        top.pack_propagate(False)
+        brand = tk.Label(
+            top,
+            text="Serminal",
+            bg=self.colors["panel"],
+            fg="#e5e7eb",
+            font=("Noto Sans", 13, "bold"),
+        )
+        brand.pack(side="left", padx=(14, 8))
+        subtitle = tk.Label(
+            top,
+            text="Open Serialis Terminal",
+            bg=self.colors["panel"],
+            fg=self.colors["text_soft"],
+            font=("Noto Sans", 10),
+        )
+        subtitle.pack(side="left")
+
+        btn_new = tk.Button(
+            top,
+            text="+ New Tab",
+            command=self.new_tab,
+            bg=self.colors["panel_alt"],
+            fg="#e5e7eb",
+            activebackground=self.colors["accent_dim"],
+            activeforeground="#e5e7eb",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Noto Sans", 10, "bold"),
+            cursor="hand2",
+        )
+        btn_new.pack(side="right", padx=(8, 8), pady=8)
+        btn_close = tk.Button(
+            top,
+            text="Close Tab",
+            command=self.close_current_tab,
+            bg=self.colors["panel_alt"],
+            fg="#e5e7eb",
+            activebackground=self.colors["accent_dim"],
+            activeforeground="#e5e7eb",
+            relief="flat",
+            bd=0,
+            padx=12,
+            pady=6,
+            font=("Noto Sans", 10),
+            cursor="hand2",
+        )
+        btn_close.pack(side="right", padx=(8, 0), pady=8)
+        hints = tk.Label(
+            top,
+            text="Ctrl+Shift+T  New Tab   Ctrl+Shift+W  Close",
+            bg=self.colors["panel"],
+            fg=self.colors["text_soft"],
+            font=("Noto Sans", 9),
+        )
+        hints.pack(side="right", padx=(0, 10))
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True)
+        self.tabs: List[PtyTab] = []
+
+        self.root.bind("<Control-Shift-T>", lambda _e: self.new_tab())
+        self.root.bind("<Control-Shift-W>", lambda _e: self.close_current_tab())
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.new_tab()
+        self.schedule_poll()
+
+    def setup_styles(self) -> None:
+        style = self.ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(
+            "TNotebook",
+            background=self.colors["bg"],
+            borderwidth=0,
+            tabmargins=(12, 8, 12, 0),
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=self.colors["panel_alt"],
+            foreground="#d1d5db",
+            padding=(14, 8),
+            borderwidth=0,
+            font=("Noto Sans", 10, "bold"),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", self.colors["terminal_bg"]), ("active", self.colors["muted"])],
+            foreground=[("selected", "#f9fafb"), ("active", "#f9fafb")],
+        )
+
+    def new_tab(self) -> None:
+        title = f"Tab {len(self.tabs) + 1}"
+        tab = PtyTab(self, title=title)
+        self.tabs.append(tab)
+        self.notebook.add(tab.frame, text=title)
+        self.notebook.select(tab.frame)
+        self.refresh_tab_titles()
+
+    def current_tab(self) -> Optional[PtyTab]:
+        current_widget = self.notebook.select()
+        for tab in self.tabs:
+            if str(tab.frame) == current_widget:
+                return tab
+        return None
+
+    def close_current_tab(self) -> None:
+        tab = self.current_tab()
+        if tab is None:
+            return
+        tab.close()
+        self.notebook.forget(tab.frame)
+        self.tabs = [t for t in self.tabs if t is not tab]
+        self.refresh_tab_titles()
+        if not self.tabs:
+            self.root.destroy()
+
+    def schedule_poll(self) -> None:
+        for tab in list(self.tabs):
+            tab.process_output()
+            tab.check_process()
+            if tab.closed:
+                try:
+                    idx = self.notebook.index(tab.frame)
+                    self.notebook.forget(idx)
+                except Exception:
+                    pass
+                self.tabs = [t for t in self.tabs if t is not tab]
+                self.refresh_tab_titles()
+        if not self.tabs:
+            self.root.destroy()
+            return
+        self.root.after(16, self.schedule_poll)
+
+    def refresh_tab_titles(self) -> None:
+        for idx, tab in enumerate(self.tabs, start=1):
+            tab.title = f"Tab {idx}"
+            self.notebook.tab(tab.frame, text=tab.title)
+
+    def on_close(self) -> None:
+        for tab in self.tabs:
+            tab.close()
+        self.root.destroy()
+
+    def run(self) -> int:
+        self.root.mainloop()
+        return 0
+
+
+def launch_gui(settings: Dict) -> int:
+    return launch_vte_gui(settings)
+
+
+def launch_vte_gui(settings: Dict) -> int:
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return 3
+
+    try:
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Gdk", "4.0")
+        gi.require_version("Vte", "3.91")
+        from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte
+    except Exception:
+        return 2
+
+    class VteSerminalApp(Gtk.Application):
+        def __init__(self) -> None:
+            super().__init__(application_id="org.openserialis.Serminal")
+            self.window = None
+            self.notebook = None
+            self.tabs: List[Vte.Terminal] = []
+            self.settings = settings
+            self.shell = script_shell(self.settings)
+            self.gui = gui_settings(self.settings)
+            self.theme = gui_theme(self.gui["theme"])
+            self.css_provider = None
+            self.hint_label = None
+            self.btn_new = None
+            self.btn_close = None
+            self.btn_settings = None
+            self.logo_modes = ["auto", "sixel", "chafa"]
+            self.theme_names = list(GUI_THEMES.keys())
+            self.default_logo_width = "28"
+            self.default_logo_height = "14"
+            self.animations_enabled = bool(self.gui.get("animations", True))
+
+        def do_activate(self) -> None:
+            if self.window is None:
+                self.build_ui()
+            self.window.present()
+
+        def build_ui(self) -> None:
+            self.window = Gtk.ApplicationWindow(application=self)
+            self.window.set_title("Serminal")
+            self.window.set_default_size(1150, 740)
+
+            header = Gtk.HeaderBar()
+            title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            title = Gtk.Label(label="Serminal")
+            title.add_css_class("brand-title")
+            subtitle = Gtk.Label(label="Open Serialis Terminal")
+            subtitle.add_css_class("brand-subtitle")
+            title_box.append(title)
+            title_box.append(subtitle)
+            header.set_title_widget(title_box)
+            self.window.set_titlebar(header)
+
+            btn_new = Gtk.Button(label="+ New Tab")
+            btn_new.add_css_class("btn-primary")
+            btn_new.connect("clicked", lambda _b: self.new_tab())
+            header.pack_end(btn_new)
+            self.btn_new = btn_new
+
+            btn_close = Gtk.Button(label="Close Tab")
+            btn_close.add_css_class("btn-secondary")
+            btn_close.connect("clicked", lambda _b: self.close_current_tab())
+            header.pack_end(btn_close)
+            self.btn_close = btn_close
+            btn_settings = Gtk.Button(label="Settings")
+            btn_settings.add_css_class("btn-secondary")
+            btn_settings.connect("clicked", lambda _b: self.open_settings())
+            header.pack_end(btn_settings)
+            self.btn_settings = btn_settings
+
+            hint = Gtk.Label(label="Ctrl+Shift+T New Tab   Ctrl+Shift+W Close")
+            hint.add_css_class("shortcut-hint")
+            header.pack_start(hint)
+            self.hint_label = hint
+
+            self.notebook = Gtk.Notebook()
+            self.notebook.set_scrollable(True)
+            self.window.set_child(self.notebook)
+
+            action_new = Gio.SimpleAction.new("new_tab", None)
+            action_new.connect("activate", lambda _a, _p: self.new_tab())
+            self.add_action(action_new)
+            self.set_accels_for_action("app.new_tab", ["<Ctrl><Shift>T"])
+
+            action_close = Gio.SimpleAction.new("close_tab", None)
+            action_close.connect("activate", lambda _a, _p: self.close_current_tab())
+            self.add_action(action_close)
+            self.set_accels_for_action("app.close_tab", ["<Ctrl><Shift>W"])
+            action_settings = Gio.SimpleAction.new("settings", None)
+            action_settings.connect("activate", lambda _a, _p: self.open_settings())
+            self.add_action(action_settings)
+            self.set_accels_for_action("app.settings", ["<Ctrl>comma"])
+
+            self.apply_theme()
+            self.apply_shortcuts_visibility()
+            self.apply_animation_settings()
+
+            self.new_tab()
+            self.startup_animation()
+
+        def css_for_theme(self) -> str:
+            t = self.theme
+            return f"""
+            window {{ background: {t['window_bg']}; color: {t['header_text']}; }}
+            headerbar {{
+                background: linear-gradient(90deg, {t['header_from']}, {t['header_to']});
+                color: {t['header_text']};
+                border-bottom: 1px solid {t['tab_border']};
+            }}
+            headerbar:backdrop {{ color: {t['header_text']}; }}
+            label.brand-title {{ color: {t['header_text']}; font-size: 1.05rem; font-weight: 700; }}
+            label.brand-subtitle {{ color: {t['muted_text']}; font-size: 0.9rem; }}
+            label.shortcut-hint {{ color: {t['muted_text']}; font-size: 0.85rem; }}
+            notebook > header {{ background: {t['header_from']}; border-bottom: 1px solid {t['tab_border']}; }}
+            notebook > header > tabs > tab {{
+                background: {t['tab_bg']};
+                color: {t['tab_text']};
+                border: 1px solid {t['tab_border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+                margin: 8px 4px 8px 4px;
+            }}
+            notebook > header > tabs > tab:checked {{
+                background: {t['tab_selected_bg']};
+                color: {t['header_text']};
+                border-color: {t['tab_selected_border']};
+            }}
+            button.btn-secondary {{
+                background: {t['button_bg']};
+                color: {t['button_text']};
+                border-radius: 8px;
+                border: 1px solid {t['button_border']};
+                padding: 6px 10px;
+                font-weight: 600;
+                min-height: 34px;
+                min-width: 108px;
+                box-shadow: none;
+                text-shadow: none;
+            }}
+            button.btn-secondary:hover {{
+                background: {t['button_hover_bg']};
+                border-color: {t['button_hover_border']};
+            }}
+            button.btn-secondary:active {{
+                background: {t['button_hover_bg']};
+                border-color: {t['button_hover_border']};
+            }}
+            button.btn-secondary:backdrop {{
+                background: {t['button_bg']};
+                color: {t['button_text']};
+                border-color: {t['button_border']};
+            }}
+            button.btn-secondary > label,
+            button.btn-secondary:backdrop > label,
+            button.btn-secondary:hover > label,
+            button.btn-secondary:active > label {{
+                color: {t['button_text']};
+                opacity: 1;
+                font-weight: 700;
+            }}
+            button.btn-primary {{
+                background: {t['button_primary_bg']};
+                color: {t['button_primary_text']};
+                border-radius: 8px;
+                border: 1px solid {t['button_primary_border']};
+                padding: 6px 10px;
+                font-weight: 700;
+                min-height: 34px;
+                min-width: 116px;
+                box-shadow: none;
+                text-shadow: none;
+            }}
+            button.btn-primary:hover {{
+                background: {t['button_hover_bg']};
+                border-color: {t['button_hover_border']};
+            }}
+            button.btn-primary:active {{
+                background: {t['button_hover_bg']};
+                border-color: {t['button_hover_border']};
+            }}
+            button.btn-primary:backdrop {{
+                background: {t['button_primary_bg']};
+                color: {t['button_primary_text']};
+                border-color: {t['button_primary_border']};
+            }}
+            button.btn-primary > label,
+            button.btn-primary:backdrop > label,
+            button.btn-primary:hover > label,
+            button.btn-primary:active > label {{
+                color: {t['button_primary_text']};
+                opacity: 1;
+                font-weight: 800;
+            }}
+            button.btn-hyde-glow {{
+                border-color: {t['tab_selected_border']};
+                box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.30);
+            }}
+            """
+
+        def apply_shortcuts_visibility(self) -> None:
+            if self.hint_label is None:
+                return
+            self.hint_label.set_visible(bool(self.gui.get("show_shortcuts", True)))
+
+        def apply_animation_settings(self) -> None:
+            self.animations_enabled = bool(self.gui.get("animations", True))
+            if self.notebook is not None and not self.animations_enabled:
+                self.notebook.set_opacity(1.0)
+
+        def pulse_button(self, button: Optional[Gtk.Button], ms: int = 240) -> None:
+            if button is None:
+                return
+            button.add_css_class("btn-hyde-glow")
+
+            def remove() -> bool:
+                button.remove_css_class("btn-hyde-glow")
+                return False
+
+            GLib.timeout_add(ms, remove)
+
+        def startup_animation(self) -> None:
+            if self.notebook is None:
+                return
+            if not self.animations_enabled:
+                self.notebook.set_opacity(1.0)
+                return
+            self.notebook.set_opacity(0.0)
+            start_us = GLib.get_monotonic_time()
+            duration_us = 260_000
+
+            def step() -> bool:
+                elapsed = GLib.get_monotonic_time() - start_us
+                progress = min(1.0, elapsed / duration_us)
+                eased = 1.0 - ((1.0 - progress) ** 3)
+                self.notebook.set_opacity(eased)
+                return progress < 1.0
+
+            GLib.timeout_add(16, step)
+            self.pulse_button(self.btn_new, 300)
+
+        def apply_theme(self) -> None:
+            self.theme = gui_theme(self.gui.get("theme", "openserialis"))
+            provider = Gtk.CssProvider()
+            provider.load_from_data(self.css_for_theme().encode("utf-8"))
+            display = Gdk.Display.get_default()
+            if self.css_provider is not None:
+                Gtk.StyleContext.remove_provider_for_display(display, self.css_provider)
+            Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.css_provider = provider
+            for term in self.tabs:
+                term.set_font(Pango.FontDescription(self.resolve_terminal_font()))
+                term.set_color_background(self.parse_rgba(self.theme["term_bg"]))
+                term.set_color_foreground(self.parse_rgba(self.theme["term_fg"]))
+                term.set_color_cursor(self.parse_rgba(self.theme["cursor"]))
+            self.apply_shortcuts_visibility()
+            self.apply_animation_settings()
+
+        def parse_rgba(self, value: str) -> Gdk.RGBA:
+            rgba = Gdk.RGBA()
+            if not rgba.parse(value):
+                rgba = Gdk.RGBA(0, 0, 0, 1)
+            return rgba
+
+        def available_font_families(self) -> Set[str]:
+            families: Set[str] = set()
+            try:
+                font_map = Pango.FontMap.get_default()
+                for family in font_map.list_families():
+                    families.add(family.get_name())
+            except Exception:
+                return families
+            return families
+
+        def resolve_terminal_font(self) -> str:
+            configured = str(self.gui.get("font", "")).strip()
+            if configured:
+                configured_family = configured.rsplit(" ", 1)[0]
+                if configured_family in self.available_font_families():
+                    return configured
+            available = self.available_font_families()
+            for candidate in DEFAULT_MONO_FONT_CANDIDATES:
+                family = candidate.rsplit(" ", 1)[0]
+                if family in available:
+                    return candidate
+            return "monospace 11"
+
+        def apply_terminal_style(self, term: Vte.Terminal, sixel_enabled: bool) -> str:
+            term.set_font(Pango.FontDescription(self.resolve_terminal_font()))
+            term.set_color_background(self.parse_rgba(self.theme["term_bg"]))
+            term.set_color_foreground(self.parse_rgba(self.theme["term_fg"]))
+            term.set_color_cursor(self.parse_rgba(self.theme["cursor"]))
+            logo_mode = str(self.gui.get("logo_mode", "auto")).lower()
+            if logo_mode not in self.logo_modes:
+                logo_mode = "auto"
+            if logo_mode == "auto":
+                return "sixel" if sixel_enabled else "chafa"
+            if logo_mode == "sixel" and not sixel_enabled:
+                return "chafa"
+            return logo_mode
+
+        def new_tab(self) -> None:
+            term = Vte.Terminal()
+            term.set_scrollback_lines(20000)
+            # Enable inline image protocols when the local VTE build supports them.
+            sixel_enabled = False
+            if hasattr(term, "set_enable_sixel"):
+                try:
+                    term.set_enable_sixel(True)
+                    if hasattr(term, "get_enable_sixel"):
+                        sixel_enabled = bool(term.get_enable_sixel())
+                    else:
+                        sixel_enabled = True
+                except Exception:
+                    sixel_enabled = False
+            if hasattr(term, "set_enable_legacy_osc777"):
+                try:
+                    term.set_enable_legacy_osc777(True)
+                except Exception:
+                    pass
+
+            env_map = {k: v for k, v in os.environ.items()}
+            env_map.setdefault("TERM", "xterm-256color")
+            env_map.setdefault("COLORTERM", "truecolor")
+            logo_type = self.apply_terminal_style(term, sixel_enabled)
+            env_map.setdefault("FASTFETCH_LOGO_TYPE", logo_type)
+            env_map.setdefault("FASTFETCH_LOGO_WIDTH", self.default_logo_width)
+            env_map.setdefault("FASTFETCH_LOGO_HEIGHT", self.default_logo_height)
+            env = [f"{k}={v}" for k, v in env_map.items()]
+            argv = [self.shell, "-i"]
+            term.spawn_async(
+                Vte.PtyFlags.DEFAULT,
+                os.getcwd(),
+                argv,
+                env,
+                GLib.SpawnFlags.DEFAULT,
+                None,
+                None,
+                -1,
+                None,
+                None,
+                None,
+            )
+            term.connect("child-exited", self.on_child_exited, term)
+
+            tab_label = Gtk.Label(label=f"Tab {len(self.tabs) + 1}")
+            self.notebook.append_page(term, tab_label)
+            self.tabs.append(term)
+            self.refresh_tab_titles()
+            self.notebook.set_current_page(len(self.tabs) - 1)
+            if self.animations_enabled:
+                term.set_opacity(0.0)
+                start_us = GLib.get_monotonic_time()
+                duration_us = 200_000
+
+                def fade_in() -> bool:
+                    elapsed = GLib.get_monotonic_time() - start_us
+                    progress = min(1.0, elapsed / duration_us)
+                    eased = progress * progress * (3 - 2 * progress)
+                    term.set_opacity(eased)
+                    return progress < 1.0
+
+                GLib.timeout_add(16, fade_in)
+                self.pulse_button(self.btn_new, 220)
+            self.window.present()
+
+        def close_current_tab(self) -> None:
+            idx = self.notebook.get_current_page()
+            if idx < 0:
+                return
+            widget = self.notebook.get_nth_page(idx)
+            if widget is None:
+                return
+            self.notebook.remove_page(idx)
+            self.tabs = [t for t in self.tabs if t is not widget]
+            self.refresh_tab_titles()
+            if not self.tabs:
+                self.quit()
+
+        def open_settings(self) -> None:
+            dialog = Gtk.Dialog(transient_for=self.window, modal=True, title="Serminal Settings")
+            dialog.set_default_size(460, 280)
+            dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            dialog.add_button("Save", Gtk.ResponseType.OK)
+
+            content = dialog.get_content_area()
+            grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+            content.append(grid)
+
+            shell_entry = Gtk.Entry(text=self.settings.get("shell", "bash"))
+            font_entry = Gtk.Entry(text=str(self.gui.get("font", DEFAULT_SETTINGS["gui"]["font"])))
+            theme_dropdown = Gtk.DropDown.new_from_strings(self.theme_names)
+            logo_dropdown = Gtk.DropDown.new_from_strings(self.logo_modes)
+            shortcuts_switch = Gtk.Switch(active=bool(self.gui.get("show_shortcuts", True)))
+            animations_switch = Gtk.Switch(active=bool(self.gui.get("animations", True)))
+
+            try:
+                theme_dropdown.set_selected(self.theme_names.index(self.gui.get("theme", "openserialis")))
+            except ValueError:
+                theme_dropdown.set_selected(0)
+            try:
+                logo_dropdown.set_selected(self.logo_modes.index(str(self.gui.get("logo_mode", "auto")).lower()))
+            except ValueError:
+                logo_dropdown.set_selected(0)
+
+            def add_row(row: int, label_text: str, widget) -> None:
+                label = Gtk.Label(label=label_text, xalign=0)
+                grid.attach(label, 0, row, 1, 1)
+                grid.attach(widget, 1, row, 1, 1)
+
+            add_row(0, "Shell", shell_entry)
+            add_row(1, "Font", font_entry)
+            add_row(2, "Theme", theme_dropdown)
+            add_row(3, "Logo Mode", logo_dropdown)
+            add_row(4, "Show Shortcuts", shortcuts_switch)
+            add_row(5, "Animations (HyDE)", animations_switch)
+
+            def on_response(dlg: Gtk.Dialog, response_id: int) -> None:
+                if response_id == Gtk.ResponseType.OK:
+                    new_shell = shell_entry.get_text().strip() or "bash"
+                    if shutil.which(new_shell) is None:
+                        new_shell = self.settings.get("shell", "bash")
+                    self.settings["shell"] = new_shell
+                    self.settings.setdefault("gui", {})
+                    self.settings["gui"]["font"] = font_entry.get_text().strip() or DEFAULT_SETTINGS["gui"]["font"]
+                    self.settings["gui"]["theme"] = self.theme_names[theme_dropdown.get_selected()]
+                    self.settings["gui"]["logo_mode"] = self.logo_modes[logo_dropdown.get_selected()]
+                    self.settings["gui"]["show_shortcuts"] = shortcuts_switch.get_active()
+                    self.settings["gui"]["animations"] = animations_switch.get_active()
+                    self.shell = script_shell(self.settings)
+                    self.gui = gui_settings(self.settings)
+                    save_settings(self.settings)
+                    self.apply_theme()
+                dlg.destroy()
+
+            dialog.connect("response", on_response)
+            dialog.present()
+
+        def on_child_exited(self, _term: Vte.Terminal, _status: int, term: Vte.Terminal) -> None:
+            idx = self.notebook.page_num(term)
+            if idx >= 0:
+                self.notebook.remove_page(idx)
+            self.tabs = [t for t in self.tabs if t is not term]
+            self.refresh_tab_titles()
+            if not self.tabs:
+                self.quit()
+
+        def refresh_tab_titles(self) -> None:
+            for idx, term in enumerate(self.tabs, start=1):
+                label = self.notebook.get_tab_label(term)
+                if isinstance(label, Gtk.Label):
+                    label.set_label(f"Tab {idx}")
+
+    app = VteSerminalApp()
+    return app.run([])
+
+
+def decode_terminal_stream(data: bytes) -> str:
+    text = data.decode("utf-8", errors="replace")
+    text = ANSI_OSC_RE.sub("", text)
+    text = ANSI_CSI_RE.sub("", text)
+    text = ANSI_ESC_RE.sub("", text)
+    # Keep printable text + terminal control chars we emulate.
+    return "".join(ch for ch in text if ch in {"\n", "\r", "\t", "\b"} or ch >= " ")
+
+
+def start_best_mode(settings: Dict) -> int:
+    return launch_gui(settings)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="serminal", description="Serminal terminal toolkit")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("start", help="Start Serminal GUI (same as 'gui')")
+    sub.add_parser("shell", help="Launch interactive Serminal shell")
+    sub.add_parser("gui", help="Launch tabbed PTY terminal GUI")
+
+    run_p = sub.add_parser("run", help="Run a .sh or .tssh script")
+    run_p.add_argument("script")
+    run_p.add_argument("script_args", nargs=argparse.REMAINDER)
+
+    settings_p = sub.add_parser("settings", help="Manage settings")
+    settings_sub = settings_p.add_subparsers(dest="settings_cmd", required=True)
+    settings_sub.add_parser("show")
+    set_p = settings_sub.add_parser("set")
+    set_p.add_argument("key")
+    set_p.add_argument("value")
+
+    lib_p = sub.add_parser("lib", help="Manage script libraries")
+    lib_sub = lib_p.add_subparsers(dest="lib_cmd", required=True)
+    lib_sub.add_parser("list")
+    create_p = lib_sub.add_parser("create")
+    create_p.add_argument("name")
+    install_p = lib_sub.add_parser("install")
+    install_p.add_argument("name")
+    install_p.add_argument("file")
+    remove_p = lib_sub.add_parser("remove")
+    remove_p.add_argument("name")
+
+    desktop_p = sub.add_parser("install-desktop", help="Install desktop entry + MIME type")
+    desktop_p.add_argument("--system", action="store_true", help="Install in /usr/share (requires root)")
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    settings = load_settings()
+
+    if args.cmd == "start":
+        rc = start_best_mode(settings)
+        if rc == 2:
+            print(
+                "error: GTK/VTE backend missing. Install: python-gobject gtk4 vte4 chafa (CachyOS/Arch).",
+                file=sys.stderr,
+            )
+            return 1
+        if rc == 3:
+            print("error: no graphical display found (X11/Wayland).", file=sys.stderr)
+            return 1
+        return rc
+    if args.cmd == "shell":
+        return launch_shell(settings)
+    if args.cmd == "gui":
+        rc = launch_gui(settings)
+        if rc == 2:
+            print(
+                "error: GTK/VTE backend missing. Install: python-gobject gtk4 vte4 chafa (CachyOS/Arch).",
+                file=sys.stderr,
+            )
+            return 1
+        if rc == 3:
+            print("error: no graphical display found (X11/Wayland).", file=sys.stderr)
+            return 1
+        return rc
+
+    if args.cmd == "run":
+        return run_script(Path(args.script), settings, args.script_args)
+
+    if args.cmd == "settings":
+        if args.settings_cmd == "show":
+            return settings_show(settings)
+        if args.settings_cmd == "set":
+            return settings_set(settings, args.key, args.value)
+
+    if args.cmd == "lib":
+        if args.lib_cmd == "list":
+            return lib_list()
+        if args.lib_cmd == "create":
+            return lib_create(args.name)
+        if args.lib_cmd == "install":
+            return lib_install(args.name, Path(args.file))
+        if args.lib_cmd == "remove":
+            return lib_remove(args.name)
+
+    if args.cmd == "install-desktop":
+        return install_desktop(args.system)
+
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
