@@ -26,6 +26,20 @@ Clone + install in one command (Open Serialis and other distros supported by `sc
 git clone https://github.com/3x1om/Serminal.git && cd Serminal && sudo bash scripts/install-system.sh
 ```
 
+## One-command uninstall (remove Serminal + delete folder)
+
+From inside the cloned `Serminal` folder:
+
+```bash
+sudo bash scripts/uninstall-system.sh
+```
+
+Use this to uninstall but keep source files:
+
+```bash
+sudo bash scripts/uninstall-system.sh --keep-source
+```
+
 GUI shortcuts:
 
 - `Ctrl+Shift+T`: new tab
