@@ -23,7 +23,7 @@ DEFAULT_SETTINGS = {
     "show_startup_message": True,
     "gui": {
         "theme": "openserialis",
-        "font": "JetBrainsMono Nerd Font 11",
+        "font": "JetBrainsMono Nerd Font 12",
         "show_shortcuts": True,
         "logo_mode": "auto",
         "animations": True,
@@ -1188,24 +1188,43 @@ def launch_vte_gui(settings: Dict) -> int:
                 return families
             return families
 
+        def available_mono_families(self) -> Set[str]:
+            families: Set[str] = set()
+            try:
+                font_map = Pango.FontMap.get_default()
+                for family in font_map.list_families():
+                    if family.is_monospace():
+                        families.add(family.get_name())
+            except Exception:
+                return families
+            return families
+
         def resolve_terminal_font(self) -> str:
             configured = str(self.gui.get("font", "")).strip()
+            mono_available = self.available_mono_families()
             if configured:
                 configured_family = configured.rsplit(" ", 1)[0]
-                if configured_family in self.available_font_families():
+                if configured_family in mono_available:
                     return configured
-            available = self.available_font_families()
+            available = mono_available
             for candidate in DEFAULT_MONO_FONT_CANDIDATES:
                 family = candidate.rsplit(" ", 1)[0]
                 if family in available:
                     return candidate
-            return "monospace 11"
+            return "monospace 12"
 
         def apply_terminal_style(self, term: Vte.Terminal, sixel_enabled: bool) -> str:
             term.set_font(Pango.FontDescription(self.resolve_terminal_font()))
             term.set_color_background(self.parse_rgba(self.theme["term_bg"]))
             term.set_color_foreground(self.parse_rgba(self.theme["term_fg"]))
             term.set_color_cursor(self.parse_rgba(self.theme["cursor"]))
+            # Force an opaque terminal layer so text contrast is stable on themed backgrounds.
+            if hasattr(term, "set_clear_background"):
+                try:
+                    term.set_clear_background(True)
+                except Exception:
+                    pass
+            term.set_opacity(1.0)
             logo_mode = str(self.gui.get("logo_mode", "auto")).lower()
             if logo_mode not in self.logo_modes:
                 logo_mode = "auto"
